@@ -1,0 +1,26 @@
+# API keys & secrets
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# LaTeX build
+*.aux
+*.log
+*.out
+*.toc
+
+# Temp / test
+test_*.py
