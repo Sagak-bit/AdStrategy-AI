@@ -983,59 +983,61 @@ with tab_agent:
         st.info("에이전트를 초기화하는 중입니다... 사이드바를 확인해주세요.")
         st.stop()
 
-    for entry in st.session_state.chat_history:
-        role = entry["role"]
-        content = entry["content"]
-        with st.chat_message(role):
-            st.markdown(content)
-            if "tool_results" in entry and entry["tool_results"]:
-                render_tool_results(entry["tool_results"])
-
+    chat_container = st.container()
     quick_msg = st.session_state.pop("quick_start_msg", None)
     user_input = st.chat_input("광고에 대해 무엇이든 물어보세요...")
     message_to_send = quick_msg or user_input
 
-    if message_to_send:
-        message_to_send = message_to_send.strip()
-        if not message_to_send:
-            st.warning("메시지를 입력해주세요.")
-            st.stop()
+    with chat_container:
+        for entry in st.session_state.chat_history:
+            role = entry["role"]
+            content = entry["content"]
+            with st.chat_message(role):
+                st.markdown(content)
+                if "tool_results" in entry and entry["tool_results"]:
+                    render_tool_results(entry["tool_results"])
 
-        if len(message_to_send) > MAX_INPUT_LENGTH:
-            st.warning(f"메시지가 너무 깁니다 (최대 {MAX_INPUT_LENGTH}자). 줄여서 입력해주세요.")
-            message_to_send = message_to_send[:MAX_INPUT_LENGTH]
+        if message_to_send:
+            message_to_send = message_to_send.strip()
+            if not message_to_send:
+                st.warning("메시지를 입력해주세요.")
+                st.stop()
 
-        with st.chat_message("user"):
-            st.markdown(message_to_send)
+            if len(message_to_send) > MAX_INPUT_LENGTH:
+                st.warning(f"메시지가 너무 깁니다 (최대 {MAX_INPUT_LENGTH}자). 줄여서 입력해주세요.")
+                message_to_send = message_to_send[:MAX_INPUT_LENGTH]
 
-        st.session_state.chat_history.append({
-            "role": "user",
-            "content": message_to_send,
-        })
+            with st.chat_message("user"):
+                st.markdown(message_to_send)
 
-        with st.chat_message("assistant"):
-            with st.spinner("분석 중..."):
-                try:
-                    response_text, tool_results = st.session_state.agent.chat(message_to_send)
-                except Exception as e:
-                    error_msg = str(e)
-                    if "rate_limit" in error_msg.lower() or "429" in error_msg:
-                        response_text = "API 호출 한도에 도달했습니다. 잠시 후 다시 시도해주세요."
-                    elif "authentication" in error_msg.lower() or "401" in error_msg:
-                        response_text = "API 키가 유효하지 않습니다. 사이드바에서 올바른 키를 입력해주세요."
-                    elif "timeout" in error_msg.lower():
-                        response_text = "응답 시간이 초과되었습니다. 질문을 간단하게 줄여서 다시 시도해주세요."
-                    else:
-                        response_text = f"오류가 발생했습니다: {error_msg}"
-                    tool_results = []
+            st.session_state.chat_history.append({
+                "role": "user",
+                "content": message_to_send,
+            })
 
-            st.markdown(response_text)
-            if tool_results:
-                render_tool_results(tool_results)
+            with st.chat_message("assistant"):
+                with st.spinner("분석 중..."):
+                    try:
+                        response_text, tool_results = st.session_state.agent.chat(message_to_send)
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "rate_limit" in error_msg.lower() or "429" in error_msg:
+                            response_text = "API 호출 한도에 도달했습니다. 잠시 후 다시 시도해주세요."
+                        elif "authentication" in error_msg.lower() or "401" in error_msg:
+                            response_text = "API 키가 유효하지 않습니다. 사이드바에서 올바른 키를 입력해주세요."
+                        elif "timeout" in error_msg.lower():
+                            response_text = "응답 시간이 초과되었습니다. 질문을 간단하게 줄여서 다시 시도해주세요."
+                        else:
+                            response_text = f"오류가 발생했습니다: {error_msg}"
+                        tool_results = []
 
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "content": response_text,
-            "tool_results": tool_results,
-        })
-        st.session_state.tool_results = tool_results
+                st.markdown(response_text)
+                if tool_results:
+                    render_tool_results(tool_results)
+
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": response_text,
+                "tool_results": tool_results,
+            })
+            st.session_state.tool_results = tool_results
