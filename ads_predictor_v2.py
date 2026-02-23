@@ -10,23 +10,39 @@
   5. SHAP 분석 (피처 중요도 해석)
   6. 보강된 피처 활용 (매크로, 시즌, 트렌드, 크리에이티브 등)
 """
+from __future__ import annotations
 
-import pandas as pd
-import numpy as np
+import logging
 import os
-import sys
-import io
-import warnings
 import pickle
-from datetime import datetime
+import warnings
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from config import (
+    AD_SPEND_BIN_LABELS,
+    AD_SPEND_BINS,
+    CONFIDENCE_HIGH_THRESHOLD,
+    CONFIDENCE_MEDIUM_THRESHOLD,
+    CONFIDENCE_Z_95,
+    CV_N_SPLITS,
+    DEFAULT_RANDOM_STATE,
+    LEAKAGE_FEATURES,
+    MIN_CPC_FLOOR,
+    MIN_NON_NULL_RATIO,
+    PREDICT_ENRICHED_DEFAULTS,
+    TRAIN_TEST_SPLIT_RATIO,
+)
+
+logger = logging.getLogger(__name__)
 
 from sklearn.model_selection import (
     train_test_split, cross_val_score, KFold, TimeSeriesSplit,
     RandomizedSearchCV
 )
-from sklearn.preprocessing import (
-    LabelEncoder, StandardScaler, OneHotEncoder
-)
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import (
@@ -36,14 +52,11 @@ from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.neural_network import MLPRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-# Windows 콘솔 인코딩 (interactive mode only, skip if running unbuffered)
-try:
-    if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-except Exception:
-    pass
+from utils import configure_windows_encoding
+configure_windows_encoding()
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 # 선택적 임포트
 try:
@@ -85,11 +98,12 @@ class AdsPredictor_V2:
     - 하이퍼파라미터 자동 튜닝
     """
 
-    def __init__(self, data_path='data/enriched_ads_final.csv',
-                 fallback_path='global_ads_performance_dataset.csv',
+    def __init__(self, data_path=None,
+                 fallback_path=None,
                  use_temporal_split=True,
                  log_transform_target=True,
-                 tune_hyperparams=False):
+                 tune_hyperparams=False,
+                 exclude_leakage=False):
         """
         Parameters:
         -----------
@@ -98,7 +112,16 @@ class AdsPredictor_V2:
         use_temporal_split : bool - 시간 기반 분할 사용 여부
         log_transform_target : bool - ROAS 로그 변환 여부
         tune_hyperparams : bool - 하이퍼파라미터 자동 튜닝 (느림)
+        exclude_leakage : bool - True면 leakage 피처(bounce_rate,
+            landing_page_load_time, creative_impact_factor)를 자동 제외.
+            이 변수들은 ROAS를 입력으로 사용하여 생성된 역인과 구조를 가짐.
+            Ablation study V5에서 확인: 제거 시 honest R² = 0.40~0.53.
         """
+        from config import ENRICHED_DATA_PATH, BASE_DATA_PATH
+
+        data_path = data_path or ENRICHED_DATA_PATH
+        fallback_path = fallback_path or BASE_DATA_PATH
+
         print("=" * 70)
         print("[ADS PREDICTOR V2] Initializing...")
         print("=" * 70)
@@ -106,8 +129,10 @@ class AdsPredictor_V2:
         self.use_temporal_split = use_temporal_split
         self.log_transform_target = log_transform_target
         self.tune_hyperparams = tune_hyperparams
+        self.exclude_leakage = exclude_leakage
 
-        # 데이터 로드
+        self.LEAKAGE_FEATURES = LEAKAGE_FEATURES
+
         if os.path.exists(data_path):
             self.df = pd.read_csv(data_path)
             self.data_source = data_path
@@ -127,10 +152,8 @@ class AdsPredictor_V2:
         print(f"[INFO] Temporal split: {'Yes' if use_temporal_split else 'No'}")
         print(f"[INFO] Log transform: {'Yes' if log_transform_target else 'No'}")
 
-        self.label_encoders = {}
-        self.models = {}
-        self.preprocessors = {}
-        self.feature_importances = {}
+        self.models: dict[str, dict[str, Any]] = {}
+        self.feature_importances: dict[str, pd.Series] = {}
 
         self.target_columns = ['ROAS', 'CPC', 'CPA', 'conversions', 'revenue']
 
@@ -172,8 +195,8 @@ class AdsPredictor_V2:
 
         self.df['ad_spend_bin'] = pd.cut(
             self.df['ad_spend'],
-            bins=[0, 1000, 3000, 5000, 10000, 20000, float('inf')],
-            labels=[0, 1, 2, 3, 4, 5]
+            bins=AD_SPEND_BINS,
+            labels=AD_SPEND_BIN_LABELS,
         ).astype(float).fillna(0).astype(int)
         self.num_features.append('ad_spend_bin')
 
@@ -201,15 +224,24 @@ class AdsPredictor_V2:
             'is_video', 'video_length_sec', 'has_cta',
             'headline_length', 'copy_sentiment', 'num_products_shown',
             'audience_size', 'is_retargeting', 'is_lookalike',
-            'landing_page_load_time', 'bounce_rate',
+            'landing_page_load_time',       # LEAKAGE: f(ROAS) + noise
+            'bounce_rate',                  # LEAKAGE: f(ROAS) + noise
             'avg_session_duration', 'funnel_steps',
-            'creative_impact_factor',
+            'creative_impact_factor',       # LEAKAGE: derived from above
             # Phase 4: 경쟁
             'industry_avg_cpc', 'cpc_vs_industry_avg',
             'competition_index', 'platform_growth_index', 'auction_density',
         ]
+
+        # exclude_leakage=True이면 leakage 피처 제거
+        if self.exclude_leakage:
+            before_count = len(enriched_num)
+            enriched_num = [c for c in enriched_num if c not in self.LEAKAGE_FEATURES]
+            removed = before_count - len(enriched_num)
+            print(f"  [LEAKAGE] exclude_leakage=True: {removed}개 leakage 피처 제거"
+                  f" ({', '.join(self.LEAKAGE_FEATURES)})")
         for col in enriched_num:
-            if col in self.df.columns and self.df[col].notna().sum() > len(self.df) * 0.3:
+            if col in self.df.columns and self.df[col].notna().sum() > len(self.df) * MIN_NON_NULL_RATIO:
                 self.num_features.append(col)
 
         # 중복 제거
@@ -221,26 +253,23 @@ class AdsPredictor_V2:
 
         self.all_features = self.cat_features + self.num_features
 
-        # ----- Label Encoder (예측 시 입력용) -----
+        # 유니크 값 저장 (입력 검증용)
+        self.unique_values: dict[str, list[Any]] = {}
         for col in self.cat_features:
-            le = LabelEncoder()
-            self.df[col + '_le'] = le.fit_transform(self.df[col].astype(str))
-            self.label_encoders[col] = le
-
-        # 유니크 값 저장
-        self.unique_values = {}
-        for col in self.cat_features:
-            self.unique_values[col] = self.df[col].unique().tolist()
+            self.unique_values[col] = sorted(self.df[col].dropna().unique().tolist())
         self.unique_values['month'] = list(range(1, 13))
 
         # ----- NaN 처리 -----
         for col in self.num_features:
             if self.df[col].isnull().any():
-                self.df[col] = self.df[col].fillna(self.df[col].median())
+                median_val = self.df[col].median()
+                self.df[col] = self.df[col].fillna(median_val if pd.notna(median_val) else 0)
 
         for col in self.cat_features:
             if self.df[col].isnull().any():
-                self.df[col] = self.df[col].fillna(self.df[col].mode()[0])
+                mode_vals = self.df[col].mode()
+                fill_val = mode_vals.iloc[0] if len(mode_vals) > 0 else "Unknown"
+                self.df[col] = self.df[col].fillna(fill_val)
 
         print(f"  Total samples: {len(self.df)}")
         print(f"  Categorical features ({len(self.cat_features)}): {self.cat_features}")
@@ -277,8 +306,7 @@ class AdsPredictor_V2:
 
         # Temporal split or random split
         if self.use_temporal_split and 'date' in self.df.columns:
-            # 시간 기반: 마지막 20%를 테스트로
-            split_idx = int(len(self.df) * 0.8)
+            split_idx = int(len(self.df) * TRAIN_TEST_SPLIT_RATIO)
             train_idx = list(range(split_idx))
             test_idx = list(range(split_idx, len(self.df)))
             print(f"  Split: Temporal (train: {len(train_idx)}, test: {len(test_idx)})")
@@ -336,18 +364,7 @@ class AdsPredictor_V2:
                     X_train, y_train, X_test, y_test
                 )
 
-            # 전체 데이터로 재학습
-            best_model.fit(X_processed, y_transformed)
-
-            # 잔차 계산 (원래 스케일로)
-            y_pred_all = best_model.predict(X_processed)
-            if apply_log:
-                y_pred_all_orig = np.expm1(y_pred_all)
-                residuals = y - y_pred_all_orig
-            else:
-                residuals = y - y_pred_all
-
-            # R2 계산 (테스트 데이터 기준, 원래 스케일)
+            # R² / MAE는 재학습 전(train/test 분리 상태)에서 측정해야 정직한 지표
             y_test_pred = best_model.predict(X_test)
             if apply_log:
                 y_test_pred_orig = np.expm1(y_test_pred)
@@ -357,6 +374,16 @@ class AdsPredictor_V2:
             else:
                 test_r2 = r2_score(y_test, y_test_pred)
                 test_mae = mean_absolute_error(y_test, y_test_pred)
+
+            # 전체 데이터로 재학습 (배포용 모델)
+            best_model.fit(X_processed, y_transformed)
+
+            # 잔차 계산 (신뢰 구간용, 전체 데이터 기준)
+            y_pred_all = best_model.predict(X_processed)
+            if apply_log:
+                residuals = y - np.expm1(y_pred_all)
+            else:
+                residuals = y - y_pred_all
 
             self.models[target] = {
                 'model': best_model,
@@ -422,7 +449,7 @@ class AdsPredictor_V2:
         for name, model in models.items():
             try:
                 # Cross-validation
-                cv = TimeSeriesSplit(n_splits=3) if self.use_temporal_split else KFold(n_splits=3, shuffle=True, random_state=42)
+                cv = TimeSeriesSplit(n_splits=CV_N_SPLITS) if self.use_temporal_split else KFold(n_splits=CV_N_SPLITS, shuffle=True, random_state=DEFAULT_RANDOM_STATE)
                 cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='r2')
 
                 model.fit(X_train, y_train)
@@ -459,8 +486,8 @@ class AdsPredictor_V2:
                 if ens_r2 > results[best_name]['r2']:
                     best_model = ensemble
                     best_name = 'Ensemble'
-            except Exception:
-                pass
+            except (ValueError, RuntimeError) as e:
+                logger.debug("Ensemble failed: %s", e)
 
         return best_model, best_name, results
 
@@ -487,8 +514,8 @@ class AdsPredictor_V2:
                 'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
             }
 
-            model = xgb.XGBRegressor(**params, random_state=42, n_jobs=-1, verbosity=0)
-            cv = TimeSeriesSplit(n_splits=3)
+            model = xgb.XGBRegressor(**params, random_state=DEFAULT_RANDOM_STATE, n_jobs=-1, verbosity=0)
+            cv = TimeSeriesSplit(n_splits=CV_N_SPLITS)
             scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='r2')
             return scores.mean()
 
@@ -498,7 +525,7 @@ class AdsPredictor_V2:
         best_params = study.best_params
         print(f"    [OPTUNA] Best R2 (CV): {study.best_value:.3f}")
 
-        best_model = xgb.XGBRegressor(**best_params, random_state=42, n_jobs=-1, verbosity=0)
+        best_model = xgb.XGBRegressor(**best_params, random_state=DEFAULT_RANDOM_STATE, n_jobs=-1, verbosity=0)
         best_model.fit(X_train, y_train)
         y_pred = best_model.predict(X_test)
         r2 = r2_score(y_test, y_pred)
@@ -508,13 +535,13 @@ class AdsPredictor_V2:
         print(f"    XGBoost_Tuned       R2: {r2:.3f}, MAE: {mae:.2f}")
 
         # 기본 모델도 비교
-        _, base_name, base_results = self._train_models_for_target(X_train, y_train, X_test, y_test)
+        base_model, base_name, base_results = self._train_models_for_target(X_train, y_train, X_test, y_test)
         results.update(base_results)
 
         if r2 > base_results.get(base_name, {}).get('r2', 0):
             return best_model, 'XGBoost_Tuned', results
         else:
-            return _, base_name, results
+            return base_model, base_name, results
 
     def _randomized_search_tune(self, X_train, y_train, X_test, y_test):
         """RandomizedSearchCV로 하이퍼파라미터 튜닝"""
@@ -528,8 +555,8 @@ class AdsPredictor_V2:
             'min_samples_split': [2, 5, 10],
         }
 
-        gb = GradientBoostingRegressor(random_state=42)
-        cv = TimeSeriesSplit(n_splits=3) if self.use_temporal_split else 3
+        gb = GradientBoostingRegressor(random_state=DEFAULT_RANDOM_STATE)
+        cv = TimeSeriesSplit(n_splits=CV_N_SPLITS) if self.use_temporal_split else CV_N_SPLITS
         search = RandomizedSearchCV(
             gb, param_dist, n_iter=20, cv=cv, scoring='r2',
             random_state=42, n_jobs=-1
@@ -586,8 +613,10 @@ class AdsPredictor_V2:
                          ('country', country), ('campaign_type', campaign_type)]:
             if col in self.unique_values and val not in self.unique_values[col]:
                 raise ValueError(f"Invalid {col}: '{val}'. Choose from: {self.unique_values[col]}")
-        if month not in range(1, 13):
+        if not 1 <= int(month) <= 12:
             raise ValueError("month must be 1-12")
+        if ad_spend < 0:
+            raise ValueError("ad_spend must be non-negative")
 
         # 피처 딕셔너리 생성
         quarter = (month - 1) // 3 + 1
@@ -607,29 +636,12 @@ class AdsPredictor_V2:
             'week_of_year': month * 4,
         }
 
-        # 보강 피처 기본값 채우기
+        # 보강 피처 기본값 (config에서 관리, 런타임 동적 값만 오버라이드)
         enriched_defaults = {
-            'cpi_index': 110.0, 'cpi_yoy_pct': 3.0, 'unemployment_rate': 4.0,
-            'gdp_growth_pct': 2.0, 'exchange_rate_usd': 1.0,
-            'is_public_holiday': 0, 'days_to_next_holiday': 15,
+            **PREDICT_ENRICHED_DEFAULTS,
             'is_shopping_season': 1 if month >= 11 else 0,
             'season_intensity': 3 if month >= 11 else 1,
-            'is_major_event': 0, 'platform_event_impact': 0,
-            'is_month_start': 0, 'is_month_end': 0,
-            'trend_index': 50.0, 'trend_momentum': 0.0,
-            'is_video': 0, 'video_length_sec': 0, 'has_cta': 1,
-            'headline_length': 45, 'copy_sentiment': 0.7,
-            'num_products_shown': 1, 'audience_size': ad_spend * 200,
-            'is_retargeting': 0, 'is_lookalike': 0,
-            'landing_page_load_time': 2.5, 'bounce_rate': 50.0,
-            'avg_session_duration': 120.0, 'funnel_steps': 3,
-            'creative_impact_factor': 1.0,
-            'industry_avg_cpc': 3.0, 'cpc_vs_industry_avg': 1.0,
-            'competition_index': 5.0, 'platform_growth_index': 100,
-            'auction_density': 5.0,
-            'ad_format': 'image', 'cta_type': 'Learn More',
-            'target_age_group': '25-34', 'target_gender': 'All',
-            'target_interest': 'General',
+            'audience_size': ad_spend * 200,
         }
 
         for col in self.all_features:
@@ -661,17 +673,17 @@ class AdsPredictor_V2:
                 'predicted': round(float(pred), 2),
                 'ci_68': (round(max(0, float(pred - std)), 2),
                           round(float(pred + std), 2)),
-                'ci_95': (round(max(0, float(pred - 1.96 * std)), 2),
-                          round(float(pred + 1.96 * std), 2)),
-                'confidence': ('High' if model_info['r2_score'] > 0.5
-                               else 'Medium' if model_info['r2_score'] > 0.3
+                'ci_95': (round(max(0, float(pred - CONFIDENCE_Z_95 * std)), 2),
+                          round(float(pred + CONFIDENCE_Z_95 * std), 2)),
+                'confidence': ('High' if model_info['r2_score'] > CONFIDENCE_HIGH_THRESHOLD
+                               else 'Medium' if model_info['r2_score'] > CONFIDENCE_MEDIUM_THRESHOLD
                                else 'Low'),
                 'model_used': model_info['model_name'],
             }
 
         # 파생 지표
         if 'CPC' in predictions:
-            cpc_pred = max(predictions['CPC']['predicted'], 0.1)
+            cpc_pred = max(predictions['CPC']['predicted'], MIN_CPC_FLOOR)
             predictions['estimated_clicks'] = {
                 'predicted': round(ad_spend / cpc_pred, 0),
                 'confidence': predictions['CPC']['confidence'],
@@ -700,14 +712,19 @@ class AdsPredictor_V2:
             'historical_reference': historical,
         }
 
-    def _get_ad_spend_bin(self, ad_spend):
-        bins = [1000, 3000, 5000, 10000, 20000]
-        for i, b in enumerate(bins):
+    def _get_ad_spend_bin(self, ad_spend: float) -> int:
+        thresholds = AD_SPEND_BINS[1:-1]  # [1000, 3000, 5000, 10000, 20000]
+        for i, b in enumerate(thresholds):
             if ad_spend <= b:
                 return i
-        return 5
+        return len(thresholds)
 
-    def _get_historical_stats(self, platform, industry, country, campaign_type):
+    def _get_historical_stats(
+        self, platform: str, industry: str, country: str, campaign_type: str,
+    ) -> dict[str, Any]:
+        if self.df is None or self.df.empty:
+            return {'exact_match_count': 0}
+
         mask = (
             (self.df['platform'] == platform) &
             (self.df['industry'] == industry) &
@@ -716,14 +733,14 @@ class AdsPredictor_V2:
         )
         exact = self.df[mask]
 
-        stats = {'exact_match_count': len(exact)}
+        stats: dict[str, Any] = {'exact_match_count': len(exact)}
         if len(exact) > 0 and 'ROAS' in exact.columns:
             stats['exact_match_stats'] = {
-                'avg_ROAS': round(exact['ROAS'].mean(), 2),
-                'median_ROAS': round(exact['ROAS'].median(), 2),
-                'std_ROAS': round(exact['ROAS'].std(), 2),
-                'min_ROAS': round(exact['ROAS'].min(), 2),
-                'max_ROAS': round(exact['ROAS'].max(), 2),
+                'avg_ROAS': round(float(exact['ROAS'].mean()), 2),
+                'median_ROAS': round(float(exact['ROAS'].median()), 2),
+                'std_ROAS': round(float(exact['ROAS'].std()), 2),
+                'min_ROAS': round(float(exact['ROAS'].min()), 2),
+                'max_ROAS': round(float(exact['ROAS'].max()), 2),
             }
         return stats
 
@@ -790,7 +807,10 @@ class AdsPredictor_V2:
     # ===================================================================
     # 모델 저장/로드
     # ===================================================================
-    def _save_models(self, path='./models'):
+    def _save_models(self, path=None):
+        if path is None:
+            from config import MODELS_DIR
+            path = MODELS_DIR
         os.makedirs(path, exist_ok=True)
         model_data = {
             'models': self.models,
@@ -799,7 +819,6 @@ class AdsPredictor_V2:
             'cat_features': self.cat_features,
             'num_features': self.num_features,
             'unique_values': self.unique_values,
-            'label_encoders': self.label_encoders,
             'feature_names': self.feature_names,
             'feature_importances': self.feature_importances,
         }
@@ -808,16 +827,27 @@ class AdsPredictor_V2:
         print(f"  Models saved to {path}/predictor_v2.pkl")
 
     @classmethod
-    def load(cls, path='./models/predictor_v2.pkl'):
-        """저장된 모델 로드"""
+    def load(cls, path: str | None = None) -> "AdsPredictor_V2":
+        """저장된 모델 로드. 누락된 속성에 안전한 기본값을 설정한다."""
+        if path is None:
+            from config import PREDICTOR_PKL_PATH
+            path = PREDICTOR_PKL_PATH
+
         with open(path, 'rb') as f:
             data = pickle.load(f)
 
         instance = cls.__new__(cls)
         for key, val in data.items():
             setattr(instance, key, val)
+
         instance.target_columns = list(data['models'].keys())
-        print(f"[INFO] Loaded model from {path}")
+        instance.df = getattr(instance, 'df', None)
+        instance.exclude_leakage = getattr(instance, 'exclude_leakage', False)
+        instance.log_transform_target = getattr(instance, 'log_transform_target', True)
+        instance.use_temporal_split = getattr(instance, 'use_temporal_split', True)
+        instance.LEAKAGE_FEATURES = LEAKAGE_FEATURES
+
+        logger.info("Loaded model from %s", path)
         return instance
 
 

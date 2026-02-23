@@ -5,12 +5,17 @@ Phase 1: Kaggle 유사 광고 데이터셋 검색/다운로드/병합
 - 현재 스키마(14개 컬럼)에 맞춰 자동 매핑/병합
 - 데이터 볼륨을 최소 10,000행 이상으로 확대
 """
+from __future__ import annotations
 
-import pandas as pd
-import numpy as np
-import os
 import json
+import logging
+import os
 from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # Kaggle API는 선택적 임포트
 try:

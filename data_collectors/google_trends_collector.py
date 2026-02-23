@@ -6,12 +6,17 @@ Phase 2-3: Google Trends 산업별 관심도 수집
 - 국가별 + 월별 관심도 지수 수집
 - fallback: API 불가 시 합리적인 추정 데이터 생성
 """
+from __future__ import annotations
 
-import pandas as pd
-import numpy as np
+import logging
 import os
 import time
 from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # pytrends (선택적)
 try:

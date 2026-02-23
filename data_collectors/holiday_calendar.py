@@ -6,11 +6,16 @@ Phase 2-2: 시즌/공휴일 달력 데이터 매핑 테이블
 - 주요 글로벌 이벤트 달력
 - 피처: is_holiday, days_to_next_holiday, shopping_season, major_event
 """
+from __future__ import annotations
 
-import pandas as pd
-import numpy as np
+import logging
 import os
 from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # holidays 패키지 (선택적)
 try:

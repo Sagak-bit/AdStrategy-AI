@@ -7,10 +7,16 @@ Phase 4: 경쟁 환경 데이터 수집 + 합성 데이터 생성
 - 4-4: 데이터 밸런싱 (저/고성과 균형)
 """
 
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
+import logging
 import os
-from datetime import datetime
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # 합성 데이터 관련 (선택적)
 try:
@@ -58,88 +64,73 @@ MONTHLY_COMPETITION = {
 class CompetitionDataCollector:
     """광고 경쟁 환경 데이터를 생성하고 제공하는 클래스"""
 
-    def __init__(self, seed=42):
+    def __init__(self, seed: int = 42) -> None:
         self.rng = np.random.RandomState(seed)
-        print("[Phase 4-1] Competition Data Collector initialized")
+        logger.info("[Phase 4-1] Competition Data Collector initialized (seed=%d)", seed)
 
-    def generate_competition_metrics(self, ads_df):
-        """
-        광고 데이터에 경쟁 환경 메트릭 추가
-        - industry_avg_cpc: 산업 평균 CPC
-        - cpc_vs_industry_avg: 내 CPC / 산업 평균
-        - competition_index: 경쟁 강도 지수 (0-10)
-        - platform_growth_index: 플랫폼 광고주 수 성장 인덱스
-        - estimated_auction_density: 추정 경매 밀도
-        """
-        print(f"\n[Phase 4-1] Generating competition metrics...")
+    def generate_competition_metrics(self, ads_df: pd.DataFrame) -> pd.DataFrame:
+        """광고 데이터에 경쟁 환경 메트릭 추가 (벡터화)."""
+        logger.info("[Phase 4-1] Generating competition metrics...")
         df = ads_df.copy()
-        df['date'] = pd.to_datetime(df['date'])
-        df['year'] = df['date'].dt.year
-        df['month'] = df['date'].dt.month
+        df["date"] = pd.to_datetime(df["date"])
+        year = df["date"].dt.year
+        month = df["date"].dt.month
+        n = len(df)
 
-        # 1. 산업 평균 CPC
-        df['industry_avg_cpc'] = df.apply(
-            lambda row: INDUSTRY_AVG_CPC.get(row['industry'], {}).get(
-                row['year'], 3.0
-            ) + self.rng.normal(0, 0.2),
-            axis=1
-        )
-        df['industry_avg_cpc'] = df['industry_avg_cpc'].clip(0.5, 15.0)
-
-        # 2. 내 CPC vs 산업 평균
-        df['cpc_vs_industry_avg'] = np.where(
-            df['industry_avg_cpc'] > 0,
-            df['CPC'] / df['industry_avg_cpc'],
-            1.0
+        # 1. 산업 평균 CPC (벡터화 — 산업+연도 조합 lookup)
+        industry_avg = np.full(n, 3.0)
+        for ind, year_map in INDUSTRY_AVG_CPC.items():
+            for yr, val in year_map.items():
+                mask = (df["industry"] == ind) & (year == yr)
+                industry_avg[mask] = val
+        df["industry_avg_cpc"] = np.clip(
+            industry_avg + self.rng.normal(0, 0.2, size=n), 0.5, 15.0,
         )
 
-        # 3. 월별 경쟁 강도 지수 (산업/플랫폼/월 조합)
-        df['competition_index'] = df['month'].map(MONTHLY_COMPETITION)
-        # 산업별 보정
-        industry_comp_factor = {
-            'Fintech': 1.2, 'SaaS': 1.3, 'Healthcare': 1.1,
-            'E-commerce': 1.0, 'EdTech': 0.85,
-        }
-        df['competition_index'] = df.apply(
-            lambda row: min(10, row['competition_index'] * industry_comp_factor.get(row['industry'], 1.0)
-                           + self.rng.normal(0, 0.5)),
-            axis=1
-        ).clip(1, 10).round(1)
-
-        # 4. 플랫폼 광고주 성장 인덱스
-        df['platform_growth_index'] = df.apply(
-            lambda row: PLATFORM_ADVERTISER_INDEX.get(row['platform'], {}).get(
-                row['year'], 100
-            ),
-            axis=1
+        # 2. CPC vs 산업 평균
+        df["cpc_vs_industry_avg"] = np.where(
+            df["industry_avg_cpc"] > 0, df["CPC"] / df["industry_avg_cpc"], 1.0,
         )
 
-        # 5. 추정 경매 밀도 (competition_index * platform_growth 정규화)
-        df['auction_density'] = (
-            df['competition_index'] * df['platform_growth_index'] / 100
-        ).round(2)
+        # 3. 월별 경쟁 강도 (벡터화)
+        base_comp = month.map(MONTHLY_COMPETITION).values.astype(float)
+        industry_factor = df["industry"].map(
+            {"Fintech": 1.2, "SaaS": 1.3, "Healthcare": 1.1, "E-commerce": 1.0, "EdTech": 0.85}
+        ).fillna(1.0).values
+        df["competition_index"] = np.clip(
+            base_comp * industry_factor + self.rng.normal(0, 0.5, size=n), 1, 10,
+        ).round(1)
+
+        # 4. 플랫폼 성장 인덱스 (벡터화)
+        growth = np.full(n, 100)
+        for plat, year_map in PLATFORM_ADVERTISER_INDEX.items():
+            for yr, val in year_map.items():
+                mask = (df["platform"] == plat) & (year == yr)
+                growth[mask] = val
+        df["platform_growth_index"] = growth
+
+        # 5. 경매 밀도
+        df["auction_density"] = (df["competition_index"] * df["platform_growth_index"] / 100).round(2)
 
         # 임시 컬럼 정리
-        if 'year' not in ads_df.columns:
-            df = df.drop(columns=['year'], errors='ignore')
-        if 'month' not in ads_df.columns:
-            df = df.drop(columns=['month'], errors='ignore')
+        for col in ("year", "month"):
+            if col not in ads_df.columns and col in df.columns:
+                df = df.drop(columns=[col])
 
         added = [c for c in df.columns if c not in ads_df.columns]
-        print(f"  Added {len(added)} competition columns: {added}")
-
+        logger.info("  Added %d competition columns: %s", len(added), added)
         return df
 
 
 class SyntheticDataGenerator:
     """합성 데이터를 생성하여 데이터 볼륨과 밸런스를 개선하는 클래스"""
 
-    def __init__(self, seed=42):
+    def __init__(self, seed: int = 42) -> None:
         self.seed = seed
         self.rng = np.random.RandomState(seed)
-        print("[Phase 4-2] Synthetic Data Generator initialized")
-        print(f"  SDV (CTGAN): {'Available' if SDV_AVAILABLE else 'Not Available'}")
-        print(f"  imbalanced-learn: {'Available' if IMBLEARN_AVAILABLE else 'Not Available'}")
+        logger.info("[Phase 4-2] Synthetic Data Generator initialized (seed=%d)", seed)
+        logger.info("  SDV (CTGAN): %s", "Available" if SDV_AVAILABLE else "Not Available")
+        logger.info("  imbalanced-learn: %s", "Available" if IMBLEARN_AVAILABLE else "Not Available")
 
     # -----------------------------------------------------------------------
     # CTGAN 기반 합성 데이터
@@ -155,11 +146,10 @@ class SyntheticDataGenerator:
         epochs : int - CTGAN 학습 에폭
         """
         if not SDV_AVAILABLE:
-            print("[Phase 4-2] SDV not installed. pip install sdv")
-            print("  Using statistical sampling fallback instead.")
+            logger.info("[Phase 4-2] SDV not installed. Using statistical sampling fallback.")
             return self._statistical_sampling(df, num_rows)
 
-        print(f"\n[Phase 4-2] Generating {num_rows} synthetic rows with CTGAN...")
+        logger.info("[Phase 4-2] Generating %d synthetic rows with CTGAN...", num_rows)
 
         # 메타데이터 자동 감지
         metadata = SingleTableMetadata()
@@ -175,94 +165,104 @@ class SyntheticDataGenerator:
 
         # 합성 데이터 생성
         synthetic = synthesizer.sample(num_rows=num_rows)
-        print(f"  Generated: {len(synthetic)} rows")
+        logger.info("  Generated: %d rows", len(synthetic))
 
         return synthetic
 
     # -----------------------------------------------------------------------
     # 통계적 샘플링 기반 합성 데이터 (CTGAN 대체)
     # -----------------------------------------------------------------------
-    def _statistical_sampling(self, df, num_rows=5000):
-        """
-        CTGAN 불가 시 통계적 샘플링으로 합성 데이터 생성.
-        각 카테고리 조합에 대해 수치 컬럼의 분포를 학습하여 샘플링.
-        """
-        print(f"\n[Phase 4-2] Generating {num_rows} synthetic rows (statistical sampling)...")
+    def _statistical_sampling(self, df: pd.DataFrame, num_rows: int = 5000) -> pd.DataFrame:
+        """통계적 샘플링으로 합성 데이터 생성 (벡터화, 재현 가능)."""
+        logger.info("[Phase 4-2] Generating %d synthetic rows (statistical sampling)...", num_rows)
 
-        categorical_cols = ['platform', 'campaign_type', 'industry', 'country']
-        numeric_cols = ['impressions', 'clicks', 'CTR', 'CPC', 'ad_spend',
-                        'conversions', 'CPA', 'revenue', 'ROAS']
-        date_col = 'date'
+        categorical_cols = ["platform", "campaign_type", "industry", "country"]
+        numeric_cols = ["impressions", "clicks", "CTR", "CPC", "ad_spend",
+                        "conversions", "CPA", "revenue", "ROAS"]
+        date_col = "date"
 
-        # 사용 가능한 컬럼만 필터링
         avail_cat = [c for c in categorical_cols if c in df.columns]
         avail_num = [c for c in numeric_cols if c in df.columns]
 
-        synthetic_rows = []
-        for _ in range(num_rows):
-            # 카테고리 변수: 원본 데이터에서 랜덤 조합 선택
-            cat_sample = df[avail_cat].sample(1, random_state=None).iloc[0].to_dict()
+        # 1) 카테고리: 원본에서 재현 가능하게 샘플링
+        cat_indices = self.rng.choice(len(df), size=num_rows, replace=True)
+        cat_df = df[avail_cat].iloc[cat_indices].reset_index(drop=True)
 
-            # 해당 카테고리 그룹의 수치 분포 추출
-            mask = pd.Series(True, index=df.index)
-            for col in avail_cat:
-                mask = mask & (df[col] == cat_sample[col])
-
-            group = df[mask]
-            if len(group) < 3:
-                group = df  # 샘플 부족 시 전체 데이터 사용
-
-            # 수치 변수: 그룹 내 정규분포에서 샘플링
-            num_sample = {}
+        # 2) 각 카테고리 그룹의 수치 통계를 미리 계산
+        group_stats: dict[tuple, dict[str, tuple[float, float]]] = {}
+        for key, grp in df.groupby(avail_cat):
+            stats = {}
             for col in avail_num:
-                mean = group[col].mean()
-                std = max(group[col].std(), mean * 0.05)  # 최소 5% 변동
-                value = self.rng.normal(mean, std)
-                if col in ['impressions', 'clicks', 'conversions']:
-                    value = max(1, int(round(value)))
-                elif col in ['CTR']:
-                    value = max(0.001, min(0.2, value))
-                elif col in ['CPC', 'CPA', 'ad_spend', 'revenue', 'ROAS']:
-                    value = max(0.01, round(value, 2))
-                num_sample[col] = value
+                mu = grp[col].mean()
+                sigma = max(grp[col].std(), mu * 0.05)
+                stats[col] = (mu, sigma)
+            group_stats[key if isinstance(key, tuple) else (key,)] = stats
 
-            # 날짜: 원본 날짜 범위 내에서 랜덤
-            if date_col in df.columns:
-                min_date = pd.to_datetime(df[date_col]).min()
-                max_date = pd.to_datetime(df[date_col]).max()
-                days_range = (max_date - min_date).days
-                random_days = self.rng.randint(0, max(1, days_range))
-                cat_sample[date_col] = (min_date + pd.Timedelta(days=random_days)).strftime('%Y-%m-%d')
+        global_stats = {
+            col: (df[col].mean(), max(df[col].std(), df[col].mean() * 0.05))
+            for col in avail_num
+        }
 
-            # 파생 지표 재계산 (일관성 보장)
-            if 'clicks' in num_sample and 'impressions' in num_sample and num_sample['impressions'] > 0:
-                num_sample['CTR'] = round(num_sample['clicks'] / num_sample['impressions'], 4)
-            if 'ad_spend' in num_sample and 'clicks' in num_sample and num_sample['clicks'] > 0:
-                num_sample['CPC'] = round(num_sample['ad_spend'] / num_sample['clicks'], 2)
-            if 'ad_spend' in num_sample and 'conversions' in num_sample and num_sample['conversions'] > 0:
-                num_sample['CPA'] = round(num_sample['ad_spend'] / num_sample['conversions'], 2)
-            if 'revenue' in num_sample and 'ad_spend' in num_sample and num_sample['ad_spend'] > 0:
-                num_sample['ROAS'] = round(num_sample['revenue'] / num_sample['ad_spend'], 2)
+        # 3) 벡터화 샘플링: 그룹별로 한꺼번에 생성
+        cat_keys = cat_df[avail_cat].apply(tuple, axis=1)
+        num_data: dict[str, np.ndarray] = {col: np.empty(num_rows) for col in avail_num}
 
-            row = {**cat_sample, **num_sample}
-            synthetic_rows.append(row)
+        for key, idx in cat_keys.groupby(cat_keys).groups.items():
+            n_group = len(idx)
+            stats = group_stats.get(key, global_stats)
+            for col in avail_num:
+                mu, sigma = stats.get(col, global_stats[col])
+                num_data[col][idx] = self.rng.normal(mu, sigma, size=n_group)
 
-        synthetic_df = pd.DataFrame(synthetic_rows)
+        num_df = pd.DataFrame(num_data)
 
-        # 추가 컬럼 (원본에 있으나 위에서 처리하지 않은 것)
-        extra_cols = [c for c in df.columns if c not in synthetic_df.columns and c not in [date_col]]
+        for col in ["impressions", "clicks", "conversions"]:
+            if col in num_df.columns:
+                num_df[col] = np.maximum(1, np.round(num_df[col])).astype(int)
+        for col in ["CPC", "CPA"]:
+            if col in num_df.columns:
+                num_df[col] = np.maximum(0.01, num_df[col]).round(2)
+        if "ad_spend" in num_df.columns:
+            num_df["ad_spend"] = np.maximum(100.0, num_df["ad_spend"]).round(2)
+        if "revenue" in num_df.columns:
+            num_df["revenue"] = np.maximum(0.0, num_df["revenue"]).round(2)
+        if "CTR" in num_df.columns:
+            num_df["CTR"] = np.clip(num_df["CTR"], 0.001, 0.2)
+
+        # 4) 파생 지표 재계산 (일관성)
+        if {"clicks", "impressions"} <= set(num_df.columns):
+            num_df["CTR"] = (num_df["clicks"] / num_df["impressions"].clip(lower=1)).round(4)
+        if {"ad_spend", "clicks"} <= set(num_df.columns):
+            num_df["CPC"] = (num_df["ad_spend"] / num_df["clicks"].clip(lower=1)).round(2)
+        if {"ad_spend", "conversions"} <= set(num_df.columns):
+            num_df["CPA"] = (num_df["ad_spend"] / num_df["conversions"].clip(lower=1)).round(2)
+        if {"revenue", "ad_spend"} <= set(num_df.columns):
+            num_df["ROAS"] = (num_df["revenue"] / num_df["ad_spend"].clip(lower=100.0)).round(2)
+            real_roas_max = df["ROAS"].quantile(0.99) if "ROAS" in df.columns else 50.0
+            num_df["ROAS"] = num_df["ROAS"].clip(-real_roas_max, real_roas_max)
+
+        # 5) 날짜
+        synthetic_df = pd.concat([cat_df, num_df], axis=1)
+        if date_col in df.columns:
+            min_date = pd.to_datetime(df[date_col]).min()
+            max_date = pd.to_datetime(df[date_col]).max()
+            days_range = max(1, (max_date - min_date).days)
+            random_days = self.rng.randint(0, days_range, size=num_rows)
+            synthetic_df[date_col] = [(min_date + pd.Timedelta(days=int(d))).strftime("%Y-%m-%d") for d in random_days]
+
+        # 6) 원본에 있지만 아직 처리 안 된 추가 컬럼
+        extra_cols = [c for c in df.columns if c not in synthetic_df.columns and c != date_col]
         for col in extra_cols:
-            if df[col].dtype == 'object':
-                synthetic_df[col] = df[col].sample(num_rows, replace=True).values
+            if df[col].dtype == "object":
+                idx = self.rng.choice(len(df), size=num_rows, replace=True)
+                synthetic_df[col] = df[col].values[idx]
             else:
-                synthetic_df[col] = self.rng.normal(
-                    df[col].mean(), max(df[col].std(), 0.01), size=num_rows
-                )
+                mu = df[col].mean()
+                sigma = max(df[col].std(), 0.01)
+                synthetic_df[col] = self.rng.normal(mu, sigma, size=num_rows)
 
-        # 컬럼 순서 맞추기
         synthetic_df = synthetic_df[[c for c in df.columns if c in synthetic_df.columns]]
-
-        print(f"  Generated: {len(synthetic_df)} rows, {len(synthetic_df.columns)} columns")
+        logger.info("  Generated: %d rows, %d columns", len(synthetic_df), len(synthetic_df.columns))
         return synthetic_df
 
     # -----------------------------------------------------------------------
@@ -273,14 +273,14 @@ class SyntheticDataGenerator:
         ROAS 분포를 균등하게 만들어 모델이 저/고성과 모두 잘 학습하도록 함.
         소수 구간을 오버샘플링하여 밸런싱.
         """
-        print(f"\n[Phase 4-2] Balancing data by {target_col} distribution...")
+        logger.info("[Phase 4-2] Balancing data by %s distribution...", target_col)
 
         df_copy = df.copy()
         df_copy['perf_bin'] = pd.qcut(df_copy[target_col], q=n_bins, labels=False, duplicates='drop')
 
         bin_counts = df_copy['perf_bin'].value_counts()
         max_count = bin_counts.max()
-        print(f"  Before balancing: {bin_counts.to_dict()}")
+        logger.info("  Before balancing: %s", bin_counts.to_dict())
 
         balanced_parts = []
         for bin_val in df_copy['perf_bin'].unique():
@@ -305,7 +305,7 @@ class SyntheticDataGenerator:
         balanced = pd.concat(balanced_parts, ignore_index=True)
         balanced = balanced.drop(columns=['perf_bin'])
 
-        print(f"  After balancing: {len(df)} -> {len(balanced)} rows")
+        logger.info("  After balancing: %d -> %d rows", len(df), len(balanced))
         return balanced
 
     # -----------------------------------------------------------------------
@@ -321,10 +321,10 @@ class SyntheticDataGenerator:
         target_total : int - 목표 행 수
         balance : bool - 성과 밸런싱 여부
         """
-        print(f"\n[Phase 4-2] Augmenting dataset: {len(df)} -> target {target_total}")
+        logger.info("[Phase 4-2] Augmenting dataset: %d -> target %d", len(df), target_total)
 
         if len(df) >= target_total:
-            print("  Dataset already meets target. Skipping augmentation.")
+            logger.info("  Dataset already meets target. Skipping augmentation.")
             if balance:
                 return self.balance_by_performance(df)
             return df
@@ -335,7 +335,7 @@ class SyntheticDataGenerator:
         augmented = pd.concat([df, synthetic], ignore_index=True)
         augmented['is_synthetic'] = [0] * len(df) + [1] * len(synthetic)
 
-        print(f"  Augmented: {len(augmented)} rows (original: {len(df)}, synthetic: {len(synthetic)})")
+        logger.info("  Augmented: %d rows (original: %d, synthetic: %d)", len(augmented), len(df), len(synthetic))
 
         if balance:
             augmented = self.balance_by_performance(augmented)
@@ -346,21 +346,17 @@ class SyntheticDataGenerator:
 # ===========================================================================
 # 통합 파이프라인
 # ===========================================================================
-def run_phase4(ads_df, target_total=10000, seed=42):
-    """Phase 4 전체 실행"""
-    print("\n" + "=" * 70)
-    print("[Phase 4] Competition + Synthetic Data Pipeline")
-    print("=" * 70)
+def run_phase4(ads_df: pd.DataFrame, target_total: int = 10000, seed: int = 42) -> pd.DataFrame:
+    """Phase 4 전체 실행."""
+    logger.info("[Phase 4] Competition + Synthetic Data Pipeline")
 
-    # 4-1: 경쟁 환경 데이터
     comp = CompetitionDataCollector(seed=seed)
     df = comp.generate_competition_metrics(ads_df)
 
-    # 4-2: 합성 데이터 보강
     synth = SyntheticDataGenerator(seed=seed)
     df = synth.augment_dataset(df, target_total=target_total, balance=True)
 
-    print(f"\n[Phase 4] Final dataset: {len(df)} rows, {len(df.columns)} columns")
+    logger.info("[Phase 4] Final dataset: %d rows, %d columns", len(df), len(df.columns))
     return df
 
 

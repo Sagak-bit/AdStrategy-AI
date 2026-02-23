@@ -8,12 +8,17 @@ Phase 2-1: 거시경제 지표 수집 파이프라인
 
 country 매핑: UAE, UK, USA, Germany, Canada, India, Australia
 """
+from __future__ import annotations
 
-import pandas as pd
-import numpy as np
-import os
 import json
+import logging
+import os
 from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # HTTP 요청
 try:

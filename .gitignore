@@ -24,3 +24,20 @@ Thumbs.db
 
 # Temp / test
 test_*.py
+
+# Office temp files
+~$*
+
+# Presentation / deliverables
+*.pptx
+ads_report_v3.pdf
+ads_report_v3.tex
+axcamp.jpg
+axcamp_nobg.png
+githublogo.png
+
+# Generated results
+analysis_results.json
+
+# Playwright MCP logs
+.playwright-mcp/
