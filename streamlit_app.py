@@ -435,7 +435,7 @@ def render_leakage_audit_tab():
     if os.path.exists(risk_csv):
         risk_df = pd.read_csv(risk_csv)
         with st.expander("피처별 단독 예측 R² (상세 데이터)"):
-            st.dataframe(risk_df.sort_values("r2_score", ascending=False),
+            st.dataframe(risk_df.sort_values("r2_mean", ascending=False),
                          use_container_width=True, hide_index=True)
 
     st.divider()
