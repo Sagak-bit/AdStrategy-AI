@@ -84,6 +84,10 @@ try:
 except ImportError:
     OPTUNA_AVAILABLE = False
 
+# GPU 학습 시 XGBoost/LightGBM에 넘길 추가 인자 (use_gpu=True일 때 적용)
+XGB_GPU_KWARGS = {"tree_method": "hist", "device": "cuda"}  # XGBoost 2.x
+LGB_GPU_KWARGS = {"device": "gpu"}
+
 
 class AdsPredictor_V2:
     """
@@ -103,7 +107,8 @@ class AdsPredictor_V2:
                  use_temporal_split=True,
                  log_transform_target=True,
                  tune_hyperparams=False,
-                 exclude_leakage=False):
+                 exclude_leakage=False,
+                 use_gpu=True):
         """
         Parameters:
         -----------
@@ -116,6 +121,7 @@ class AdsPredictor_V2:
             landing_page_load_time, creative_impact_factor)를 자동 제외.
             이 변수들은 ROAS를 입력으로 사용하여 생성된 역인과 구조를 가짐.
             Ablation study V5에서 확인: 제거 시 honest R² = 0.40~0.53.
+        use_gpu : bool - True면 XGBoost/LightGBM 학습 시 GPU(CUDA) 사용 시도. 실패 시 CPU로 fallback 없음(에러 발생).
         """
         from config import ENRICHED_DATA_PATH, BASE_DATA_PATH
 
@@ -130,6 +136,7 @@ class AdsPredictor_V2:
         self.log_transform_target = log_transform_target
         self.tune_hyperparams = tune_hyperparams
         self.exclude_leakage = exclude_leakage
+        self.use_gpu = use_gpu
 
         self.LEAKAGE_FEATURES = LEAKAGE_FEATURES
 
@@ -147,6 +154,7 @@ class AdsPredictor_V2:
         print(f"[INFO] Dataset: {len(self.df)} rows, {len(self.df.columns)} columns")
         print(f"[INFO] XGBoost: {'Yes' if XGBOOST_AVAILABLE else 'No'}")
         print(f"[INFO] LightGBM: {'Yes' if LIGHTGBM_AVAILABLE else 'No'}")
+        print(f"[INFO] Use GPU (XGB/LGB): {'Yes' if use_gpu else 'No'}")
         print(f"[INFO] SHAP: {'Yes' if SHAP_AVAILABLE else 'No'}")
         print(f"[INFO] Optuna: {'Yes' if OPTUNA_AVAILABLE else 'No'}")
         print(f"[INFO] Temporal split: {'Yes' if use_temporal_split else 'No'}")
@@ -429,19 +437,25 @@ class AdsPredictor_V2:
             ),
         }
 
+        xgb_kw = dict(
+            n_estimators=100, max_depth=6, learning_rate=0.1,
+            subsample=0.8, colsample_bytree=0.8,
+            random_state=42, n_jobs=-1, verbosity=0
+        )
         if XGBOOST_AVAILABLE:
-            models['XGBoost'] = xgb.XGBRegressor(
-                n_estimators=100, max_depth=6, learning_rate=0.1,
-                subsample=0.8, colsample_bytree=0.8,
-                random_state=42, n_jobs=-1, verbosity=0
-            )
+            if getattr(self, "use_gpu", True):
+                xgb_kw.update(XGB_GPU_KWARGS)
+            models['XGBoost'] = xgb.XGBRegressor(**xgb_kw)
 
+        lgb_kw = dict(
+            n_estimators=100, max_depth=6, learning_rate=0.1,
+            subsample=0.8, colsample_bytree=0.8,
+            random_state=42, n_jobs=-1, verbosity=-1
+        )
         if LIGHTGBM_AVAILABLE:
-            models['LightGBM'] = lgb.LGBMRegressor(
-                n_estimators=100, max_depth=6, learning_rate=0.1,
-                subsample=0.8, colsample_bytree=0.8,
-                random_state=42, n_jobs=-1, verbosity=-1
-            )
+            if getattr(self, "use_gpu", True):
+                lgb_kw.update(LGB_GPU_KWARGS)
+            models['LightGBM'] = lgb.LGBMRegressor(**lgb_kw)
 
         results = {}
         trained = {}
@@ -514,7 +528,10 @@ class AdsPredictor_V2:
                 'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
             }
 
-            model = xgb.XGBRegressor(**params, random_state=DEFAULT_RANDOM_STATE, n_jobs=-1, verbosity=0)
+            kwargs = {**params, "random_state": DEFAULT_RANDOM_STATE, "n_jobs": -1, "verbosity": 0}
+            if getattr(self, "use_gpu", True):
+                kwargs.update(XGB_GPU_KWARGS)
+            model = xgb.XGBRegressor(**kwargs)
             cv = TimeSeriesSplit(n_splits=CV_N_SPLITS)
             scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='r2')
             return scores.mean()
@@ -525,7 +542,10 @@ class AdsPredictor_V2:
         best_params = study.best_params
         print(f"    [OPTUNA] Best R2 (CV): {study.best_value:.3f}")
 
-        best_model = xgb.XGBRegressor(**best_params, random_state=DEFAULT_RANDOM_STATE, n_jobs=-1, verbosity=0)
+        best_kw = {**best_params, "random_state": DEFAULT_RANDOM_STATE, "n_jobs": -1, "verbosity": 0}
+        if getattr(self, "use_gpu", True):
+            best_kw.update(XGB_GPU_KWARGS)
+        best_model = xgb.XGBRegressor(**best_kw)
         best_model.fit(X_train, y_train)
         y_pred = best_model.predict(X_test)
         r2 = r2_score(y_test, y_pred)
@@ -843,6 +863,11 @@ class AdsPredictor_V2:
         instance.target_columns = list(data['models'].keys())
         instance.df = getattr(instance, 'df', None)
         instance.exclude_leakage = getattr(instance, 'exclude_leakage', False)
+        # 학습 데이터에 없었을 수 있는 국가(Korea) 허용 — 검증 통과 후 OneHotEncoder handle_unknown='ignore'로 예측 가능
+        uv = getattr(instance, 'unique_values', {})
+        if 'country' in uv and 'Korea' not in uv['country']:
+            uv['country'] = sorted(uv['country'] + ['Korea'])
+            instance.unique_values = uv
         instance.log_transform_target = getattr(instance, 'log_transform_target', True)
         instance.use_temporal_split = getattr(instance, 'use_temporal_split', True)
         instance.LEAKAGE_FEATURES = LEAKAGE_FEATURES

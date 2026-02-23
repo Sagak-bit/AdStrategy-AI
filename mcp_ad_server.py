@@ -35,6 +35,7 @@ from config import (
     ENRICHED_DATA_PATH,
     MAX_SCENARIOS,
     MIN_AD_SPEND,
+    PREFERRED_ENRICHED_PATH,
     PREDICTOR_PKL_PATH,
     PROJECT_ROOT,
     TRENDS_DATA_PATH,
@@ -62,13 +63,13 @@ def _load_predictor() -> Any | None:
         else:
             logger.info("Pickle not found, training fresh model")
             predictor = AdsPredictor_V2(
-                data_path=ENRICHED_DATA_PATH,
+                data_path=PREFERRED_ENRICHED_PATH,
                 fallback_path=BASE_DATA_PATH,
                 exclude_leakage=True,
             )
 
         if not hasattr(predictor, "df") or predictor.df is None:
-            for path in (ENRICHED_DATA_PATH, BASE_DATA_PATH):
+            for path in (PREFERRED_ENRICHED_PATH, ENRICHED_DATA_PATH, BASE_DATA_PATH):
                 if os.path.exists(path):
                     predictor.df = pd.read_csv(path)
                     predictor.df["date"] = pd.to_datetime(
@@ -86,7 +87,7 @@ def _load_data() -> dict[str, pd.DataFrame]:
     """벤치마크/트렌드 데이터 로드."""
     data: dict[str, pd.DataFrame] = {}
     for key, primary, fallback in [
-        ("benchmark", ENRICHED_DATA_PATH, BASE_DATA_PATH),
+        ("benchmark", PREFERRED_ENRICHED_PATH, BASE_DATA_PATH),
         ("trends", TRENDS_DATA_PATH, None),
     ]:
         for path in (primary, fallback):

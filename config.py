@@ -20,6 +20,11 @@ MODELS_DIR: Final[str] = os.path.join(PROJECT_ROOT, "models")
 FIGURES_DIR: Final[str] = os.path.join(PROJECT_ROOT, "figures")
 
 ENRICHED_DATA_PATH: Final[str] = os.path.join(DATA_DIR, "enriched_ads_final.csv")
+ENRICHED_DATA_WITH_KOREA_PATH: Final[str] = os.path.join(DATA_DIR, "enriched_ads_with_korea.csv")
+# 한국 포함 파일이 있으면 우선 사용 (재학습/벤치마크용)
+PREFERRED_ENRICHED_PATH: Final[str] = (
+    ENRICHED_DATA_WITH_KOREA_PATH if os.path.exists(ENRICHED_DATA_WITH_KOREA_PATH) else ENRICHED_DATA_PATH
+)
 BASE_DATA_PATH: Final[str] = os.path.join(PROJECT_ROOT, "global_ads_performance_dataset.csv")
 TRENDS_DATA_PATH: Final[str] = os.path.join(DATA_DIR, "trends", "industry_trends.csv")
 PREDICTOR_PKL_PATH: Final[str] = os.path.join(MODELS_DIR, "predictor_v2.pkl")
