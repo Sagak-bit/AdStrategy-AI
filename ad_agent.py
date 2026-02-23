@@ -52,7 +52,7 @@ SYSTEM_PROMPT = """당신은 **AdStrategy AI**입니다. 디지털 광고 전략
 - 광고의 목표 (브랜딩, 전환, 매출, 앱 설치 등)
 
 **2단계 — 타겟 파악**
-- 타겟 국가/시장 (USA, UK, Germany, Canada, India, UAE, Australia)
+- 타겟 국가/시장 (USA, UK, Germany, Canada, India, UAE, Australia, Korea)
 - 타겟 연령대, 성별, 관심사
 
 **3단계 — 예산과 일정**
@@ -95,7 +95,7 @@ SYSTEM_PROMPT = """당신은 **AdStrategy AI**입니다. 디지털 광고 전략
 ## 사용 가능한 값
 - 플랫폼: Google Ads, Meta Ads, TikTok Ads
 - 산업: Fintech, EdTech, Healthcare, SaaS, E-commerce
-- 국가: USA, UK, Germany, Canada, India, UAE, Australia
+- 국가: USA, UK, Germany, Canada, India, UAE, Australia, Korea
 - 캠페인 유형: Search, Video, Shopping, Display
 - 타겟 연령: 18-24, 25-34, 35-44, 45-54, 55+
 """
